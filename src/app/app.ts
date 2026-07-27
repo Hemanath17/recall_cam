@@ -9,70 +9,28 @@ import {
   computed,
 } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import {
-  ObjectDetector,
-  HandLandmarker,
-  FilesetResolver,
-} from '@mediapipe/tasks-vision';
+import { ObjectDetector, FilesetResolver } from '@mediapipe/tasks-vision';
 
 export interface CamEvent {
   id: number;
   time: Date;
   action: string;
   object: string;
-  person: string;
   confidence: number;
   thumbnail: string;
 }
 
-interface Box {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-interface Track {
-  id: number;
-  label: string;
-  displayName: string;
-  box: Box;
-  lastSeenFrame: number;
-  handNearFrame: number;
-  restingCentroid: { x: number; y: number };
-  stableFrames: number;
-}
-
-/** Tuning knobs. Change these first when behaviour is wrong. */
 const CONFIG = {
-  /** Detection confidence floor. Lower if your object is missed. */
-  scoreThreshold: 0.4,
-  /** Box overlap needed to call two detections the same object. */
-  iouMatch: 0.3,
-  /** Pixels. A hand counts as near an object below this distance. */
-  handNear: 90,
-  /** Frames an object must be missing before a pickup fires. */
-  goneMin: 15,
-  /** Frames after which a disappearance is too old to matter. */
-  goneMax: 40,
-  /** How recently a hand must have been near, in frames. */
-  handRecent: 45,
-  /** Frames before a lost track is forgotten entirely. */
-  trackExpiry: 60,
-  /** Pixels of centroid drift that still counts as stationary. */
-  stillRadius: 15,
-  /** Pixels of centroid drift that counts as a deliberate move. */
-  moveRadius: 40,
-  /** Frames an object must sit still before a move can register. */
-  stableBeforeMove: 30,
-  /** Frames between buffer snapshots. */
-  bufferEvery: 5,
-  /** Snapshots retained, used to find the "before" image. */
-  bufferSize: 30,
-  /** Set false to send real requests to /api/caption. */
-  useFakeCaptions: true,
-  /** Draw the live hand-distance readout. Turn off before demoing. */
-  showTuning: true,
+  /** Low on purpose. Raise it if you get too much junk. */
+  scoreThreshold: 0.25,
+  /** Cap on simultaneous detections drawn. */
+  maxResults: 10,
+  /** Must match @mediapipe/tasks-vision in package.json. */
+  tasksVisionVersion: '0.10.35',
+  /** lite0 is fastest, lite2 is more accurate. Swap and compare. */
+  model: 'efficientdet_lite0' as 'efficientdet_lite0' | 'efficientdet_lite2',
+  /** Console dump every N frames. Set 0 to silence. */
+  logEveryFrames: 60,
 };
 
 @Component({
@@ -87,13 +45,21 @@ export class AppComponent implements OnDestroy {
   @ViewChild('canvas') canvasRef!: ElementRef<HTMLCanvasElement>;
 
   readonly running = signal(false);
-  readonly modelsReady = signal(false);
   readonly statusText = signal('Camera off');
   readonly fps = signal(0);
   readonly events = signal<CamEvent[]>([]);
   readonly query = signal('');
   readonly cameraError = signal('');
-  /** Nothing is logged until this is set. */
+
+  /** Live list of what is on screen right now. */
+  readonly seen = signal<string[]>([]);
+
+  /** True when the typed filter matches nothing currently visible. */
+  readonly noMatch = signal(false);
+  /**
+   * Optional filter. Empty shows everything; typing a COCO class name
+   * such as "cup", "bottle" or "cell phone" narrows it to that class.
+   */
   readonly watchedObject = signal('');
 
   readonly filteredEvents = computed(() => {
@@ -101,25 +67,17 @@ export class AppComponent implements OnDestroy {
     const all = this.events();
     if (!q) return all;
     return all.filter((e) =>
-      `${e.action} ${e.object} ${e.person}`.toLowerCase().includes(q)
+      (e.action + ' ' + e.object).toLowerCase().includes(q)
     );
   });
 
   private stream: MediaStream | null = null;
   private rafId = 0;
   private nextId = 1;
-  private frameTimes: number[] = [];
-
-  private detector?: ObjectDetector;
-  private handLandmarker?: HandLandmarker;
-
-  private tracks = new Map<number, Track>();
-  private nextTrackId = 1;
-  private personCount = 0;
   private frameNo = 0;
-
-  private handPoints: { x: number; y: number }[] = [];
-  private frameBuffer: string[] = [];
+  private frameTimes: number[] = [];
+  private detector?: ObjectDetector;
+  private modelReady = false;
 
   constructor(private zone: NgZone) {}
 
@@ -127,55 +85,49 @@ export class AppComponent implements OnDestroy {
     return e.id;
   }
 
-  /** Bind an input to this to choose what to watch. */
   setWatchedObject(value: string): void {
     this.watchedObject.set(value.trim().toLowerCase());
-    this.tracks.clear();
-    if (this.running()) this.updateStatus();
   }
 
-  private updateStatus(): void {
-    this.statusText.set(
-      this.watchedObject()
-        ? `Watching for ${this.watchedObject()}`
-        : 'Running. Enter an object to watch.'
-    );
-  }
+  // ---------------------------------------------------------------- model
 
-  // ---------------------------------------------------------------- models
+  private async loadModel(): Promise<void> {
+    if (this.modelReady) return;
 
-  private async loadModels(): Promise<void> {
-    if (this.modelsReady()) return;
-    this.statusText.set('Loading models…');
+    this.statusText.set('Loading model…');
 
     const vision = await FilesetResolver.forVisionTasks(
-      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+      `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${CONFIG.tasksVisionVersion}/wasm`
     );
 
-    this.detector = await ObjectDetector.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
-        delegate: 'GPU',
-      },
-      scoreThreshold: CONFIG.scoreThreshold,
-      runningMode: 'VIDEO',
-    });
+    const modelPath =
+      `https://storage.googleapis.com/mediapipe-models/object_detector/` +
+      `${CONFIG.model}/float16/1/${CONFIG.model}.tflite`;
 
-    this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath:
-          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-        delegate: 'GPU',
-      },
-      numHands: 2,
-      runningMode: 'VIDEO',
-    });
+    try {
+      this.detector = await ObjectDetector.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: modelPath, delegate: 'GPU' },
+        scoreThreshold: CONFIG.scoreThreshold,
+        maxResults: CONFIG.maxResults,
+        runningMode: 'VIDEO',
+      });
+      console.log('detector ready on GPU');
+    } catch (gpuError) {
+      // Some machines have no working WebGL. CPU is slower but always there.
+      console.warn('GPU delegate failed, falling back to CPU', gpuError);
+      this.detector = await ObjectDetector.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: modelPath, delegate: 'CPU' },
+        scoreThreshold: CONFIG.scoreThreshold,
+        maxResults: CONFIG.maxResults,
+        runningMode: 'VIDEO',
+      });
+      console.log('detector ready on CPU');
+    }
 
-    this.modelsReady.set(true);
+    this.modelReady = true;
   }
 
-  // ---------------------------------------------------------------- camera
+  // --------------------------------------------------------------- camera
 
   async start(): Promise<void> {
     if (this.running()) return;
@@ -184,23 +136,16 @@ export class AppComponent implements OnDestroy {
     this.statusText.set('Requesting camera…');
 
     if (!window.isSecureContext) {
-      this.statusText.set('Camera requires a secure context (localhost or HTTPS).');
-      this.cameraError.set(
-        'Open the app at http://localhost:4200 — not a raw file or insecure host.'
-      );
+      this.statusText.set('Camera requires localhost or HTTPS.');
       return;
     }
-
     if (!navigator.mediaDevices?.getUserMedia) {
       this.statusText.set('Camera API unavailable in this browser.');
-      this.cameraError.set(
-        'Try Chrome or Safari on http://localhost:4200. Embedded previews often block camera access.'
-      );
       return;
     }
 
     try {
-      await this.loadModels();
+      await this.loadModel();
 
       this.stream = await navigator.mediaDevices.getUserMedia({
         video: true,
@@ -228,9 +173,10 @@ export class AppComponent implements OnDestroy {
 
       canvas.width = video.videoWidth || 640;
       canvas.height = video.videoHeight || 480;
+      console.log('canvas', canvas.width, 'x', canvas.height);
 
       this.running.set(true);
-      this.updateStatus();
+      this.statusText.set('Detecting');
       this.loop();
     } catch (err) {
       const name = err instanceof DOMException ? err.name : 'Error';
@@ -240,13 +186,12 @@ export class AppComponent implements OnDestroy {
       if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
         this.statusText.set('Camera permission denied.');
         this.cameraError.set(
-          'Allow the camera for this site in your browser settings, then click Start camera again.'
+          'Allow the camera for this site, then click Start camera again.'
         );
       } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
         this.statusText.set('No camera found.');
-        this.cameraError.set('Connect a camera and try again.');
       } else {
-        this.statusText.set('Could not start camera.');
+        this.statusText.set('Could not start.');
         this.cameraError.set(`${name}: ${message}`);
       }
     }
@@ -258,8 +203,7 @@ export class AppComponent implements OnDestroy {
     this.stream = null;
     this.running.set(false);
     this.fps.set(0);
-    this.tracks.clear();
-    this.frameBuffer = [];
+    this.seen.set([]);
     this.statusText.set('Camera off');
     this.cameraError.set('');
   }
@@ -275,27 +219,42 @@ export class AppComponent implements OnDestroy {
       const tick = () => {
         if (!this.running()) return;
 
-        if (video.readyState >= 2 && this.modelsReady()) {
-          const ts = performance.now();
+        if (video.readyState >= 2 && this.modelReady) {
+          this.frameNo++;
           ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
+          const all =
+            this.detector!.detectForVideo(video, performance.now())
+              .detections ?? [];
+
           const watched = this.watchedObject();
-          const all = this.detector!.detectForVideo(video, ts).detections;
-          const relevant = all.filter((d) => {
-            const name = d.categories[0].categoryName;
-            return name === 'person' || (!!watched && name === watched);
-          });
+          const shown = watched
+            ? all.filter((d) =>
+                (d.categories[0]?.categoryName ?? '').includes(watched)
+              )
+            : all;
 
-          const hands =
-            this.handLandmarker!.detectForVideo(video, ts).landmarks;
+          this.zone.run(() =>
+            this.noMatch.set(!!watched && shown.length === 0 && all.length > 0)
+          );
 
-          this.updateTracks(relevant);
-          this.updateHands(hands, canvas);
-          this.checkProximity(ctx);
-          this.checkTriggers();
+          for (const d of shown) {
+            this.drawDetection(ctx, d);
+          }
 
-          this.draw(ctx, hands, canvas);
-          this.bufferFrame(canvas);
+          if (
+            CONFIG.logEveryFrames &&
+            this.frameNo % CONFIG.logEveryFrames === 0
+          ) {
+            const names = shown.map(
+              (d) =>
+                `${d.categories[0]?.categoryName ?? '?'} ` +
+                `${((d.categories[0]?.score ?? 0) * 100).toFixed(0)}%`
+            );
+            console.log(`frame ${this.frameNo}:`, names);
+            this.zone.run(() => this.seen.set(names));
+          }
+
           this.trackFps();
         }
 
@@ -305,262 +264,29 @@ export class AppComponent implements OnDestroy {
     });
   }
 
-  // ------------------------------------------------------------- tracking
+  private drawDetection(ctx: CanvasRenderingContext2D, d: any): void {
+    const b = d.boundingBox;
+    if (!b) return;
 
-  private iou(a: Box, b: Box): number {
-    const x1 = Math.max(a.x, b.x);
-    const y1 = Math.max(a.y, b.y);
-    const x2 = Math.min(a.x + a.w, b.x + b.w);
-    const y2 = Math.min(a.y + a.h, b.y + b.h);
-    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-    if (inter === 0) return 0;
-    return inter / (a.w * a.h + b.w * b.h - inter);
-  }
+    const category = d.categories?.[0];
+    const name = category?.categoryName || '(unlabelled)';
+    const score = category?.score ?? 0;
+    const isPerson = name === 'person';
+    const colour = isPerson ? '#1a73e8' : '#0b8043';
 
-  private updateTracks(detections: any[]): void {
-    this.frameNo++;
-    const claimed = new Set<number>();
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(b.originX, b.originY, b.width, b.height);
 
-    for (const d of detections) {
-      const bb = d.boundingBox!;
-      const box: Box = { x: bb.originX, y: bb.originY, w: bb.width, h: bb.height };
-      const label = d.categories[0].categoryName;
-      const centroid = { x: box.x + box.w / 2, y: box.y + box.h / 2 };
+    const text = `${name} ${(score * 100).toFixed(0)}%`;
+    ctx.font = '14px sans-serif';
+    const labelWidth = ctx.measureText(text).width + 8;
+    const labelY = Math.max(18, b.originY);
 
-      let bestId = -1;
-      let bestScore = CONFIG.iouMatch;
-
-      for (const [id, t] of this.tracks) {
-        if (claimed.has(id) || t.label !== label) continue;
-        const score = this.iou(box, t.box);
-        if (score > bestScore) {
-          bestScore = score;
-          bestId = id;
-        }
-      }
-
-      if (bestId !== -1) {
-        const t = this.tracks.get(bestId)!;
-        t.box = box;
-        t.lastSeenFrame = this.frameNo;
-
-        const drift = Math.hypot(
-          centroid.x - t.restingCentroid.x,
-          centroid.y - t.restingCentroid.y
-        );
-
-        if (drift < CONFIG.stillRadius) {
-          t.stableFrames++;
-        } else if (
-          drift > CONFIG.moveRadius &&
-          t.stableFrames > CONFIG.stableBeforeMove
-        ) {
-          this.onObjectMoved(t);
-          t.restingCentroid = centroid;
-          t.stableFrames = 0;
-        }
-
-        claimed.add(bestId);
-      } else {
-        const id = this.nextTrackId++;
-        const displayName =
-          label === 'person' ? `Person ${++this.personCount}` : label;
-
-        this.tracks.set(id, {
-          id,
-          label,
-          displayName,
-          box,
-          lastSeenFrame: this.frameNo,
-          handNearFrame: -9999,
-          restingCentroid: centroid,
-          stableFrames: 0,
-        });
-        claimed.add(id);
-      }
-    }
-
-    for (const [id, t] of this.tracks) {
-      if (this.frameNo - t.lastSeenFrame > CONFIG.trackExpiry) {
-        this.tracks.delete(id);
-      }
-    }
-  }
-
-  // ------------------------------------------------------------ proximity
-
-  private updateHands(hands: any[], canvas: HTMLCanvasElement): void {
-    this.handPoints = [];
-    for (const hand of hands) {
-      // wrist, thumb tip, index tip, middle tip
-      for (const i of [0, 4, 8, 12]) {
-        this.handPoints.push({
-          x: hand[i].x * canvas.width,
-          y: hand[i].y * canvas.height,
-        });
-      }
-    }
-  }
-
-  private checkProximity(ctx: CanvasRenderingContext2D): void {
-    for (const t of this.tracks.values()) {
-      if (t.label === 'person') continue;
-
-      const cx = t.box.x + t.box.w / 2;
-      const cy = t.box.y + t.box.h / 2;
-
-      let nearest = Infinity;
-      for (const p of this.handPoints) {
-        const d = Math.hypot(p.x - cx, p.y - cy);
-        if (d < nearest) nearest = d;
-      }
-
-      if (nearest < CONFIG.handNear) {
-        t.handNearFrame = this.frameNo;
-      }
-
-      if (CONFIG.showTuning && nearest < Infinity) {
-        ctx.fillStyle = nearest < CONFIG.handNear ? '#0b8043' : '#9aa2ad';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(`${nearest.toFixed(0)}px`, t.box.x, t.box.y + t.box.h + 14);
-      }
-    }
-  }
-
-  /** Which person's box contains this point, if any. */
-  private personAt(x: number, y: number): string {
-    for (const t of this.tracks.values()) {
-      if (t.label !== 'person') continue;
-      if (
-        x >= t.box.x &&
-        x <= t.box.x + t.box.w &&
-        y >= t.box.y &&
-        y <= t.box.y + t.box.h
-      ) {
-        return t.displayName;
-      }
-    }
-    return '';
-  }
-
-  // -------------------------------------------------------------- trigger
-
-  private checkTriggers(): void {
-    if (!this.watchedObject()) return;
-
-    for (const [id, t] of this.tracks) {
-      if (t.label === 'person') continue;
-
-      const goneFor = this.frameNo - t.lastSeenFrame;
-      const handWasNear = this.frameNo - t.handNearFrame;
-
-      if (
-        goneFor > CONFIG.goneMin &&
-        goneFor < CONFIG.goneMax &&
-        handWasNear < CONFIG.handRecent
-      ) {
-        const cx = t.box.x + t.box.w / 2;
-        const cy = t.box.y + t.box.h / 2;
-        this.fireEvent('picked up', t.displayName, this.personAt(cx, cy));
-        this.tracks.delete(id);
-      }
-    }
-  }
-
-  private onObjectMoved(t: Track): void {
-    const cx = t.box.x + t.box.w / 2;
-    const cy = t.box.y + t.box.h / 2;
-    this.fireEvent('moved', t.displayName, this.personAt(cx, cy));
-  }
-
-  /** Single entry point for every event, automatic or manual. */
-  private fireEvent(action: string, object: string, person: string): void {
-    const when = new Date();
-    const after = this.snapshot();
-    const before = this.frameBuffer[0] ?? after;
-
-    if (CONFIG.useFakeCaptions) {
-      this.logEvent(action, object, 0.85, when, person, after);
-      return;
-    }
-
-    void this.captionRemotely(before, after, object, person, when, action);
-  }
-
-  private async captionRemotely(
-    before: string,
-    after: string,
-    object: string,
-    person: string,
-    when: Date,
-    fallbackAction: string
-  ): Promise<void> {
-    try {
-      const res = await fetch('/api/caption', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          before: before.split(',')[1],
-          after: after.split(',')[1],
-          object,
-          person,
-        }),
-      });
-      const evt = await res.json();
-      this.logEvent(
-        evt.action ?? fallbackAction,
-        evt.object ?? object,
-        evt.confidence ?? 0.5,
-        when,
-        person,
-        after
-      );
-    } catch (err) {
-      console.error('caption failed', err);
-      this.logEvent(fallbackAction, object, 0.3, when, person, after);
-    }
-  }
-
-  // --------------------------------------------------------------- frames
-
-  private snapshot(): string {
-    return this.canvasRef.nativeElement.toDataURL('image/jpeg', 0.5);
-  }
-
-  private bufferFrame(canvas: HTMLCanvasElement): void {
-    if (this.frameNo % CONFIG.bufferEvery !== 0) return;
-    this.frameBuffer.push(canvas.toDataURL('image/jpeg', 0.5));
-    if (this.frameBuffer.length > CONFIG.bufferSize) {
-      this.frameBuffer.shift();
-    }
-  }
-
-  // -------------------------------------------------------------- drawing
-
-  private draw(
-    ctx: CanvasRenderingContext2D,
-    hands: any[],
-    canvas: HTMLCanvasElement
-  ): void {
-    for (const t of this.tracks.values()) {
-      const isPerson = t.label === 'person';
-      ctx.strokeStyle = isPerson ? '#1a73e8' : '#0b8043';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(t.box.x, t.box.y, t.box.w, t.box.h);
-
-      ctx.fillStyle = ctx.strokeStyle;
-      ctx.font = '13px sans-serif';
-      ctx.fillText(t.displayName, t.box.x, Math.max(12, t.box.y - 5));
-    }
-
-    ctx.fillStyle = '#d93025';
-    for (const hand of hands) {
-      for (const lm of hand) {
-        ctx.beginPath();
-        ctx.arc(lm.x * canvas.width, lm.y * canvas.height, 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
+    ctx.fillStyle = colour;
+    ctx.fillRect(b.originX, labelY - 18, labelWidth, 18);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(text, b.originX + 4, labelY - 5);
   }
 
   private trackFps(): void {
@@ -584,7 +310,11 @@ export class AppComponent implements OnDestroy {
 
     if (e.code === 'Space' && this.running()) {
       e.preventDefault();
-      this.fireEvent('picked up', this.watchedObject() || 'object', '');
+      this.logEvent(
+        'detected',
+        this.watchedObject() || this.seen().join(', ') || 'nothing',
+        1
+      );
     }
   }
 
@@ -592,13 +322,10 @@ export class AppComponent implements OnDestroy {
     action: string,
     object: string,
     confidence: number,
-    when: Date = new Date(),
-    person = '',
-    thumbnail?: string
+    when: Date = new Date()
   ): void {
-    const thumb =
-      thumbnail ?? (this.running() ? this.snapshot() : '');
-
+    const canvas = this.canvasRef.nativeElement;
+    const thumb = this.running() ? canvas.toDataURL('image/jpeg', 0.5) : '';
     this.zone.run(() => {
       this.events.update((list) => [
         {
@@ -606,7 +333,6 @@ export class AppComponent implements OnDestroy {
           time: when,
           action,
           object,
-          person,
           confidence,
           thumbnail: thumb,
         },
@@ -626,22 +352,13 @@ export class AppComponent implements OnDestroy {
 
     const esc = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
     const rows = [
-      [
-        'id',
-        'timestamp_iso',
-        'local_time',
-        'person',
-        'action',
-        'object',
-        'confidence',
-      ],
+      ['id', 'timestamp_iso', 'local_time', 'action', 'object', 'confidence'],
       ...[...list]
         .sort((a, b) => a.id - b.id)
         .map((e) => [
           String(e.id),
           e.time.toISOString(),
           esc(e.time.toLocaleTimeString()),
-          esc(e.person),
           esc(e.action),
           esc(e.object),
           e.confidence.toFixed(2),
