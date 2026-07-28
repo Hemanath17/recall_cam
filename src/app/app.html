@@ -58,7 +58,7 @@
         <button
           class="btn btn-ghost"
           type="button"
-          (click)="logEvent('detected', watchedObject() || seen().join(', ') || 'nothing', 1)"
+          (click)="logEvent('detected', watchedObject() || 'nothing', 1)"
           [disabled]="!running()">
           Log event
         </button>
