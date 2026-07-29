@@ -74,6 +74,7 @@ export class AppComponent implements OnDestroy {
   readonly events = signal<CamEvent[]>([]);
   readonly query = signal('');
   readonly cameraError = signal('');
+  readonly view = signal<'landing' | 'app'>('landing');
 
   /** Live list of what is on screen right now. */
   readonly seen = signal<string[]>([]);
@@ -115,6 +116,15 @@ export class AppComponent implements OnDestroy {
     this.watchedObject.set(value.trim().toLowerCase());
     // Fresh start: re-announce whatever is visible under the new target.
     this.tracker.reset();
+  }
+
+  launchApp(): void {
+    this.view.set('app');
+  }
+
+  goHome(): void {
+    this.stop(); // stop the camera when leaving the app view
+    this.view.set('landing');
   }
 
   // ---------------------------------------------------------------- model
